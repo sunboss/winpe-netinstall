@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+images/*.wim
+images/*.esd
+images/*.swm
+images/manifest.json
+images/reports.log

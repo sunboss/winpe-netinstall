@@ -1,0 +1,15 @@
+rem WinPE 网络安装 - UEFI/GPT 分区模板
+rem 由 NetInstall.ps1 调用：diskpart /s diskpart-uefi.txt
+rem 布局：EFI(100MB) + MSR(16MB) + Windows(剩余全部)
+
+select disk 0
+clean
+convert gpt
+create partition efi size=100
+format quick fs=fat32 label="System"
+assign letter="S"
+create partition msr size=16
+create partition primary
+format quick fs=ntfs label="Windows" quick
+assign letter="W"
+exit

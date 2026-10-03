@@ -1,0 +1,12 @@
+rem WinPE 网络安装 - BIOS/MBR 分区模板
+rem 由 NetInstall.ps1 调用：diskpart /s diskpart-bios.txt
+rem 布局：单 Windows 分区（剩余全部），设为活动分区
+
+select disk 0
+clean
+convert mbr
+create partition primary
+format quick fs=ntfs label="Windows" quick
+assign letter="W"
+active
+exit
