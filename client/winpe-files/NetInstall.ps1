@@ -16,6 +16,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
 $ServerFile = Join-Path $ScriptDir "server.txt"
 
+# 安装日志：失败后可回看排查（WinPE 下 X: 为内存盘）
+try { Start-Transcript -Path "X:\NetInstall\install.log" -Append -ErrorAction Stop | Out-Null } catch {}
+
 function Get-IniValue([string]$path, [string]$key) {
     $line = Select-String -Path $path -Pattern ("^\s*" + $key + "\s*=") 2>$null | Select-Object -First 1
     if ($line) { return (($line.Line -split "=", 2)[1]).Trim() }
@@ -108,7 +111,9 @@ $nic = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
 if ($nic) {
     $ip = (Get-NetIPAddress -InterfaceIndex $nic.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
            Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1).IPAddress
-    Write-Ok ("网卡 {0} 已连接，IP: {1}" -f $nic.Name, ($ip ? $ip : "获取中"))
+    $ipStr = "获取中"
+    if ($ip) { $ipStr = $ip }
+    Write-Ok ("网卡 {0} 已连接，IP: {1}" -f $nic.Name, $ipStr)
 } else {
     Write-Warn "未发现已连接的网卡，请检查网线 / Wi-Fi（Wi-Fi 需构建时加入 WinPE-WiFi-Package）"
 }
@@ -165,7 +170,8 @@ if ($images.Count -eq 0) {
 Write-Host ""
 for ($i = 0; $i -lt $images.Count; $i++) {
     $img = $images[$i]
-    $sizeGB = if ($img.size) { "{0:N2} GB" -f ($img.size / 1GB) } else { "未知" }
+    $sizeGB = "未知"
+    if ($img.size) { $sizeGB = "{0:N2} GB" -f ($img.size / 1GB) }
     Write-Host ("  [{0}] {1}  ({2}, {3})" -f ($i + 1), $img.name, $sizeGB, $img.protocol)
     if ($img.description) { Write-Host ("       {0}" -f $img.description) -ForegroundColor DarkGray }
 }
@@ -183,10 +189,29 @@ if ($disks.Count -gt 0) {
     Write-Host ""
     foreach ($d in $disks) {
         $sizeGB = "{0:N0} GB" -f ($d.Size / 1GB)
-        $tag = if ($d.BusType -eq "USB") { "[U 盘]" } else { "" }
+        $tag = ""
+        if ($d.BusType -eq "USB") { $tag = "[U 盘]" }
         Write-Host ("  [{0}] 磁盘 {1}  {2}  {3}  {4} {5}" -f $d.Number, $d.Number, $d.FriendlyName, $sizeGB, $d.PartitionStyle, $tag)
     }
-    $diskNum = Read-Choice "选择目标磁盘编号" 0 99 0
+    $maxDisk = ($disks | Measure-Object -Property Number -Maximum).Maximum
+    while ($true) {
+        $diskNum = Read-Choice "选择目标磁盘编号" 0 $maxDisk 0
+        $selDisk = $disks | Where-Object { $_.Number -eq $diskNum } | Select-Object -First 1
+        if (-not $selDisk) {
+            Write-Warn "磁盘 $diskNum 不存在，请重新选择"
+            continue
+        }
+        if ($selDisk.BusType -eq "USB") {
+            Write-Err "不能选择 U 盘本身作为安装目标（会把安装介质格掉）！请选择本机硬盘。"
+            continue
+        }
+        if ($selDisk.Size -lt 30GB) {
+            Write-Warn ("磁盘 $diskNum 仅 {0:N1} GB，Windows 安装可能空间不足" -f ($selDisk.Size / 1GB))
+            $yn = Read-Host "仍要继续吗？输入 YES 继续"
+            if ($yn -cne "YES") { continue }
+        }
+        break
+    }
 } else {
     Write-Warn "无法枚举磁盘，默认使用磁盘 0"
     $diskNum = 0
@@ -220,12 +245,15 @@ try {
     $fwType = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control").PEFirmwareType
 } catch {}
 $isUefi = ($fwType -eq 2)
-Write-Step ("固件类型: " + ($isUefi ? "UEFI" : "传统 BIOS"))
+$fwStr = "传统 BIOS"
+if ($isUefi) { $fwStr = "UEFI" }
+Write-Step ("固件类型: " + $fwStr)
 
 # ---------- 8. 准备目标分区 ----------
 if ($installMode -eq 1) {
     # --- 模式1：整盘清空，diskpart 按模板重建 ---
-    $tplName = if ($isUefi) { "diskpart-uefi.txt" } else { "diskpart-bios.txt" }
+    $tplName = "diskpart-bios.txt"
+    if ($isUefi) { $tplName = "diskpart-uefi.txt" }
     $tplPath = Join-Path $ScriptDir $tplName
     $tplContent = Get-Content $tplPath -Raw
     $tplContent = $tplContent -replace "select disk 0", "select disk $diskNum"
@@ -293,7 +321,9 @@ if ($installMode -eq 1) {
 # ---------- 9. 获取镜像文件 ----------
 $wimPath = $null
 $downloaded = $null
-$proto = ($img.protocol ?? "smb").ToLower()
+$proto = $img.protocol
+if ([string]::IsNullOrWhiteSpace($proto)) { $proto = "smb" }
+$proto = $proto.ToLower()
 
 if ($proto -eq "smb") {
     Write-Step "通过 SMB 直读镜像（无需下载）"
@@ -351,25 +381,27 @@ if ($proto -eq "smb") {
             exit 1
         }
     }
-    # SHA-256 校验
-    if ($img.sha256 -and $img.sha256 -notlike "*请替换*") {
-        Write-Step "校验镜像 SHA-256..."
-        $hash = (Get-FileHash $dest -Algorithm SHA256).Hash
-        if ($hash -ne $img.sha256.ToUpper()) {
-            Write-Err "校验失败！文件可能损坏或被篡改，已终止安装。"
-            exit 1
-        }
-        Write-Ok "校验通过"
-    } else {
-        Write-Warn "清单未提供 SHA-256，跳过校验"
-    }
     $wimPath = $dest
     $downloaded = $dest
 }
 
+# ---------- 9b. SHA-256 校验（SMB 与 HTTP 模式统一校验）----------
+if ($img.sha256 -and $img.sha256 -notlike "*请替换*") {
+    Write-Step "校验镜像 SHA-256..."
+    $hash = (Get-FileHash $wimPath -Algorithm SHA256).Hash
+    if ($hash -ne $img.sha256.ToUpper()) {
+        Write-Err "校验失败！文件可能损坏或被篡改，已终止安装。"
+        exit 1
+    }
+    Write-Ok "校验通过"
+} else {
+    Write-Warn "清单未提供 SHA-256，跳过校验（建议在 manifest.json 中填写）"
+}
+
 # ---------- 10. DISM 释放镜像 ----------
 Write-Step ("正在释放镜像到 W:（索引 {0}），请耐心等待..." -f $img.index)
-$idx = if ($img.index) { $img.index } else { 1 }
+$idx = 1
+if ($img.index) { $idx = [int]$img.index }
 & dism /Apply-Image /ImageFile:$wimPath /Index:$idx /ApplyDir:W:\
 if ($LASTEXITCODE -ne 0) {
     Write-Err "DISM 释放失败，请检查镜像文件与索引号。"
@@ -395,7 +427,11 @@ $drvDir = "X:\NetInstall\Drivers"
 if (Test-Path $drvDir) {
     Write-Step "检测到驱动目录，正在注入驱动..."
     & dism /Image:W:\ /Add-Driver /Driver:$drvDir /Recurse
-    Write-Ok "驱动注入完成（详见 DISM 输出）"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "部分驱动注入失败（不影响已释放的系统，可进系统后手动补驱动）"
+    } else {
+        Write-Ok "驱动注入完成"
+    }
 } else {
     Write-Host "  未发现 X:\NetInstall\Drivers，跳过驱动注入" -ForegroundColor DarkGray
 }
@@ -409,12 +445,16 @@ if ($proto -eq "smb") {
     net use Z: /delete 2>$null | Out-Null
 }
 try {
+    $modeStr = "keep_partitions"
+    if ($installMode -eq 1) { $modeStr = "full_wipe" }
+    $fwStr2 = "BIOS"
+    if ($isUefi) { $fwStr2 = "UEFI" }
     $report = @{
         event        = "install_completed"
         image_id     = $img.id
         disk         = $diskNum
-        install_mode = ($installMode -eq 1 ? "full_wipe" : "keep_partitions")
-        firmware     = ($isUefi ? "UEFI" : "BIOS")
+        install_mode = $modeStr
+        firmware     = $fwStr2
         computer     = $env:COMPUTERNAME
     } | ConvertTo-Json -Compress
     Invoke-RestMethod -Method Post -Uri "$base/api/report" `

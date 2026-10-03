@@ -93,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
         rows = []
         for img in images:
             size = img.get("size", 0)
-            size_str = "%.2f GB" % (size / 102.4**3) if size else "未知"
+            size_str = "%.2f GB" % (size / 1024**3) if size else "未知"
             rows.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
                 html.escape(str(img.get("id", ""))),
                 html.escape(str(img.get("name", ""))),
@@ -196,6 +196,10 @@ code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style></head>
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
             length = 0
+        # 上报体限 64KB，防止恶意大请求打爆内存
+        if length > 64 * 1024:
+            self.send_error(413, "Report Too Large")
+            return
         raw = self.rfile.read(length) if length > 0 else b""
         try:
             data = json.loads(raw.decode("utf-8")) if raw else {}
