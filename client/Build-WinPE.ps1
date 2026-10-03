@@ -5,9 +5,11 @@
 .DESCRIPTION
   1. copype 复制 WinPE 工作目录
   2. 挂载 boot.wim，注入网络/PowerShell/DISM/存储/WiFi(可选)/中文字体等组件
-  3. 复制本目录 winpe-files/（NetInstall.ps1 等）到 X:\NetInstall
-  4. 写入 startnet.cmd 实现开机自启动安装程序
-  5. 生成 ISO 和/或 U 盘启动盘
+  3. 打入 drivers\ 下的驱动（网卡等）到 boot.wim
+  4. 复制本目录 winpe-files/（NetInstall.ps1 等）到 X:\NetInstall
+  5. 写入 startnet.cmd 开机菜单（安装/命令行/重启/关机）
+  6. 生成 ISO 和/或 U 盘启动盘；U 盘根目录生成 NetInstall.ini，
+     改服务端地址、菜单默认项、安装模式无需重建优盘
 
   前置要求（在构建机上，一次性）：
   - 安装 Windows ADK（含 Deployment Tools）
@@ -17,15 +19,22 @@
 .EXAMPLE
   .\Build-WinPE.ps1 -Server "192.168.1.10:8080" -Iso "C:\iso\netinstall.iso"
 .EXAMPLE
-  .\Build-WinPE.ps1 -Server "192.168.1.10:8080" -UsbDrive "E:"
+  .\Build-WinPE.ps1 -Server "192.168.1.10:8080" -UsbDrive "E:" -Label "NETINSTALL"
+.EXAMPLE
+  .\Build-WinPE.ps1 -Server "192.168.1.10:8080" -UsbDrive "E:" -MenuTimeout 5 -DefaultChoice 1 -DefaultMode 2 -Wallpaper "C:\brand\winpe.jpg"
 #>
 param(
-    [string]$Server = "192.168.1.10:8080",   # 网络安装服务端地址，写入 server.txt
+    [string]$Server = "192.168.1.10:8080",   # 网络安装服务端地址，写入 server.txt 与 NetInstall.ini
     [string]$WorkDir = "C:\WinPE_NetInstall", # copype 工作目录
     [string]$Iso,                             # 生成 ISO 路径（可选）
     [string]$UsbDrive,                        # 制作 U 盘启动盘（可选，如 "E:"）
     [switch]$AddWifi,                         # 加入 WinPE Wi-Fi 支持（需要较新 ADK）
-    [switch]$Force                             # 已存在工作目录时强制删除重建
+    [switch]$Force,                           # 已存在工作目录时强制删除重建
+    [int]$MenuTimeout = 10,                   # 开机菜单等待秒数（写入优盘 NetInstall.ini）
+    [int]$DefaultChoice = 1,                  # 开机菜单默认项：1=安装 2=命令行 3=重启 4=关机
+    [int]$DefaultMode = 0,                    # 默认安装模式：0=每次询问 1=整盘清空 2=保留分区
+    [string]$Label = "NETINSTALL",            # 优盘卷标
+    [string]$Wallpaper = ""                   # WinPE 背景图（jpg），留空不换
 )
 
 $ErrorActionPreference = "Stop"
@@ -113,14 +122,24 @@ Copy-Item "$FilesDir\*" $destDir -Recurse -Force
 $Server | Set-Content (Join-Path $destDir "server.txt") -Encoding ASCII -NoNewline
 Write-Ok "已复制客户端文件，服务端地址: $Server（可在 U 盘/ISO 中修改 X:\NetInstall\server.txt 覆盖）"
 
-# 可选：预置驱动（把 .inf 驱动放到本目录 drivers\，构建时自动打入）
+# 可选：预置驱动（把 .inf 驱动放到本目录 drivers\，打入 boot.wim 让 WinPE 识别网卡等硬件）
 $drvSrc = Join-Path $ScriptDir "drivers"
 if ((Test-Path $drvSrc) -and (Get-ChildItem $drvSrc -Recurse -Filter "*.inf" -ErrorAction SilentlyContinue)) {
-    Write-Step "发现 drivers\ 目录，复制到启动介质（安装时自动注入目标系统）"
+    Write-Step "注入 drivers\ 驱动到 boot.wim"
+    & dism /Image:$MountDir /Add-Driver /Driver:$drvSrc /Recurse
+    if ($LASTEXITCODE -ne 0) { Write-Warn "部分驱动注入失败，可检查驱动是否匹配 WinPE 版本" }
+    # 同时复制一份到安装包，供将来注入目标系统
     Copy-Item $drvSrc "$destDir\Drivers" -Recurse -Force
-    Write-Ok "驱动已预置"
+    Write-Ok "驱动已注入 boot.wim"
 } else {
     Write-Host "  未发现 drivers\，跳过（如目标机网卡在 WinPE 下无法识别，请把驱动放入 drivers\ 后重建）" -ForegroundColor DarkGray
+}
+
+# 可选：自定义 WinPE 桌面背景
+if ($Wallpaper -and (Test-Path $Wallpaper)) {
+    Write-Step "设置 WinPE 背景图"
+    Copy-Item $Wallpaper "$MountDir\Windows\System32\winpe.jpg" -Force
+    Write-Ok "背景图已设置"
 }
 
 # ---------- 5. startnet.cmd 开机自启动 ----------
@@ -152,14 +171,49 @@ if ($UsbDrive) {
     if ($yn -cne "YES") { throw "已取消 U 盘制作" }
     & cmd /c "`"$MakeMedia`" /UFD `"$WorkDir`" $dl"
     if ($LASTEXITCODE -ne 0) { throw "U 盘制作失败" }
-    Write-Ok "U 盘启动盘已就绪"
+    Write-Ok "U 盘启动盘已写入"
+
+    # ---------- 8. 优盘定制收尾 ----------
+    Write-Step "优盘定制：卷标 / NetInstall.ini / BCD"
+    # 卷标
+    & label "$dl" $Label 2>$null
+    # NetInstall.ini（放优盘根目录，改配置无需重建）
+    $iniUrl = $Server -replace "^https?://", ""
+    $ini = @"
+; WinPE 网络安装 - 优盘配置文件（构建时生成，可直接在优盘上修改）
+; 优先级：本文件 > server.txt（X:\NetInstall 内）> 开机手动输入
+
+[Server]
+Url=$iniUrl
+
+[Boot]
+MenuTimeout=$MenuTimeout
+DefaultChoice=$DefaultChoice
+
+[Install]
+DefaultMode=$DefaultMode
+"@
+    $ini | Set-Content "$dl\NetInstall.ini" -Encoding ASCII
+    Write-Ok "已生成 $dl\NetInstall.ini（服务端 $iniUrl，菜单等待 ${MenuTimeout}s，默认安装模式 $DefaultMode）"
+    # BCD：缩短固件启动菜单等待（真正的选择菜单在 startnet.cmd）
+    foreach ($bcd in @("$dl\EFI\Microsoft\Boot\BCD", "$dl\Boot\BCD")) {
+        if (Test-Path $bcd) {
+            & bcdedit /store $bcd /set "{bootmgr}" timeout 3 2>$null | Out-Null
+            & bcdedit /store $bcd /set "{bootmgr}" description "Windows 网络安装" 2>$null | Out-Null
+        }
+    }
+    Write-Ok "BCD 已设置（卷标 $Label）"
 }
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Green
 Write-Host " 构建完成！" -ForegroundColor Green
+Write-Host " 定制优盘无需重建：直接改优盘根目录 NetInstall.ini"
+Write-Host "   - 换服务端：改 [Server] Url="
+Write-Host "   - 开机菜单：改 [Boot] MenuTimeout= / DefaultChoice=（1=安装 2=命令行 3=重启 4=关机）"
+Write-Host "   - 安装模式：改 [Install] DefaultMode=（0=每次问 1=整盘 2=保留分区）"
 Write-Host " 下一步："
 Write-Host "  1. 启动服务端: python3 netinstall_server.py --dir ./images"
 Write-Host "  2. 放入 .wim 镜像并编辑 images/manifest.json 登记"
-Write-Host "  3. 用 U 盘/ISO 启动目标机器，按提示完成网络安装"
+Write-Host "  3. 用 U 盘启动目标机器，按菜单完成网络安装"
 Write-Host "============================================================" -ForegroundColor Green

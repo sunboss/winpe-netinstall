@@ -6,10 +6,21 @@
   在 WinPE 中运行：从服务端拉取镜像清单 -> 选择镜像 -> 分区 ->
   获取镜像（SMB 直读 / HTTP 下载）-> DISM 释放 -> bcdboot 写引导 -> 重启
   由 startnet.cmd 在 WinPE 启动后自动调用，也可手动执行。
+  参数 -UsbDrive：优盘盘符（如 "E:"），用于读取优盘根目录 NetInstall.ini
+  中的服务端地址与默认安装模式（改配置无需重建优盘）。
 #>
+param(
+    [string]$UsbDrive = ""
+)
 $ErrorActionPreference = "Stop"
 $ScriptDir = $PSScriptRoot
 $ServerFile = Join-Path $ScriptDir "server.txt"
+
+function Get-IniValue([string]$path, [string]$key) {
+    $line = Select-String -Path $path -Pattern ("^\s*" + $key + "\s*=") 2>$null | Select-Object -First 1
+    if ($line) { return (($line.Line -split "=", 2)[1]).Trim() }
+    return $null
+}
 
 function Write-Step([string]$msg) {
     Write-Host ""
@@ -107,6 +118,17 @@ $server = $null
 if (Test-Path $ServerFile) {
     $server = (Get-Content $ServerFile -Raw).Trim()
 }
+# 优盘根目录 NetInstall.ini 优先级最高（改配置无需重建优盘）
+$defaultInstallMode = 1
+if ($UsbDrive -and (Test-Path "$UsbDrive\NetInstall.ini")) {
+    $iniUrl = Get-IniValue "$UsbDrive\NetInstall.ini" "Url"
+    if (-not [string]::IsNullOrWhiteSpace($iniUrl)) {
+        $server = $iniUrl -replace "^https?://", ""
+        Write-Host ("  使用优盘配置的服务端: {0}" -f $iniUrl) -ForegroundColor DarkGray
+    }
+    $iniMode = Get-IniValue "$UsbDrive\NetInstall.ini" "DefaultMode"
+    if ($iniMode -match "^[12]$") { $defaultInstallMode = [int]$iniMode }
+}
 if ([string]::IsNullOrWhiteSpace($server) -or $server -like "*192.168.1.10*") {
     Write-Host ""
     Write-Host "  当前预设服务端: $server" -ForegroundColor DarkGray
@@ -178,7 +200,7 @@ Write-Host ""
 Write-Host "  安装模式："
 Write-Host "  [1] 整盘清空安装：删除所选磁盘的全部的分區，全新分区安装"
 Write-Host "  [2] 保留分区安装：只格式化一个选定分区，其他分区数据保留"
-$installMode = Read-Choice "选择安装模式" 1 2 1
+$installMode = Read-Choice "选择安装模式" 1 2 $defaultInstallMode
 
 Write-Host ""
 if ($installMode -eq 1) {

@@ -55,11 +55,34 @@ python3 netinstall_server.py --dir ./images --port 8080
 ```powershell
 cd client
 .\Build-WinPE.ps1 -Server "192.168.1.10:8080" -Iso "C:\iso\netinstall.iso"
-# 或直接写 U 盘：
+# 或直接制作启动优盘（一键）：
 .\Build-WinPE.ps1 -Server "192.168.1.10:8080" -UsbDrive "E:"
+# 全定制示例：
+.\Build-WinPE.ps1 -Server "192.168.1.10:8080" -UsbDrive "E:" `
+  -Label "NETINSTALL" -MenuTimeout 5 -DefaultChoice 1 -DefaultMode 2 `
+  -Wallpaper "C:\brand\winpe.jpg" -AddWifi
 ```
 
-构建机会自动注入网络/PowerShell/DISM/存储/中文字体组件，并把安装程序打进 `boot.wim`。
+构建机会自动注入网络/PowerShell/DISM/存储/中文字体组件，把安装程序打进 `boot.wim`，
+并把 `drivers\` 下的驱动打入 WIM（解决部分机器 WinPE 下网卡不识别）。
+
+#### 优盘定制（无需重建）
+
+制作完成后，优盘根目录会有一个 `NetInstall.ini`，直接用记事本改，插上即生效：
+
+```ini
+[Server]
+Url=192.168.1.10:8080      ; 换服务端地址，改这里就行
+
+[Boot]
+MenuTimeout=10             ; 开机菜单等待秒数，0=直接执行默认项
+DefaultChoice=1            ; 1=网络安装 2=WinPE命令行 3=重启 4=关机
+
+[Install]
+DefaultMode=0              ; 0=每次询问 1=整盘清空 2=保留分区
+```
+
+开机后会先显示启动菜单（安装 / 命令行维护模式 / 重启 / 关机），超时自动执行默认项。
 
 ### 3. 在虚拟机里先试（推荐 Hyper-V / VMware）
 

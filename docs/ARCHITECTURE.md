@@ -25,18 +25,20 @@ Python 3 标准库实现，无第三方依赖，方便丢到任何机器上跑�
 
 - **构建**：`client/Build-WinPE.ps1` 在 Windows+ADK 上执行，`copype` → 挂载 `boot.wim` → 注入组件（WMI/NetFX/Scripting/PowerShell/DismCmdlets/StorageWMI/SecureStartup/中文字体，可选 WiFi）→ 复制 `winpe-files/` → 改写 `startnet.cmd` → 生成 ISO/U 盘。
 - **运行**：`NetInstall.ps1` 全流程：
-  1. 检查 WinPE 环境 → `wpeutil InitializeNetwork`
-  2. 读取 `server.txt`（可现场改）→ 3 次重试连通性
-  3. 拉清单 → 数字菜单选镜像
-  4. 枚举磁盘 → **显示分区布局**（序号/大小/盘符/类型/卷标）
-  5. 选择安装模式 → 按模式二次确认（输入 `YES`）：
+  1. 开机菜单（`startnet.cmd`）：网络安装 / WinPE 命令行 / 重启 / 关机，超时自动执行默认项
+  2. 读优盘根目录 `NetInstall.ini`（服务端地址、默认安装模式），无需重建优盘即可改配置
+  3. 检查 WinPE 环境 → `wpeutil InitializeNetwork`
+  4. 服务端地址：`NetInstall.ini` > `server.txt`（可现场改）→ 3 次重试连通性
+  5. 拉清单 → 数字菜单选镜像
+  6. 枚举磁盘 → **显示分区布局**（序号/大小/盘符/类型/卷标）
+  7. 选择安装模式 → 按模式二次确认（输入 `YES`）：
      - **整盘清空**：`diskpart` 按模板重建（UEFI：EFI 100MB + MSR 16MB + Windows；BIOS：单分区+active）
      - **保留分区**：只格式化选定的一个数据分区（EFI/MSR/恢复分区不可选），UEFI 下复用现有 EFI 分区写引导
-  6. 读注册表 `PEFirmwareType` 判定 UEFI/BIOS
-  7. 取镜像：
+  8. 读注册表 `PEFirmwareType` 判定 UEFI/BIOS
+  9. 取镜像：
      - `smb`：`net use Z:` 挂载共享，DISM 直接从网络路径释放（不占本地空间）
      - `http`：BITS 下载（断点续传）→ `Get-FileHash` SHA-256 校验 → 释放 → 删除临时文件
-  7. `dism /Apply-Image` → `bcdboot` 写引导 → 可选 `X:\NetInstall\Drivers` 驱动注入
+  10. `dism /Apply-Image` → `bcdboot` 写引导 → 可选 `X:\NetInstall\Drivers` 驱动注入
   8. `POST /api/report` 上报 → `wpeutil reboot`
 
 ### 2.3 镜像获取方式对比
