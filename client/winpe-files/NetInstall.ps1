@@ -29,6 +29,57 @@ function Read-Choice([string]$prompt, [int]$min, [int]$max, [int]$default) {
     }
 }
 
+# GPT 分区类型 GUID（用于识别 EFI/MSR/恢复分区）
+$GuidEfi = "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}"
+$GuidMsr = "{e3c9e316-0b5c-4db8-817d-f92df00215ae}"
+$GuidRecovery = "{de94bba4-06d1-4d40-a16a-bfd50179d6ac}"
+
+function Show-DiskLayout([int]$diskNum) {
+    Write-Host ""
+    Write-Host ("  磁盘 {0} 当前分区布局：" -f $diskNum) -ForegroundColor Yellow
+    try {
+        $parts = @(Get-Partition -DiskNumber $diskNum -ErrorAction Stop | Sort-Object PartitionNumber)
+    } catch {
+        Write-Warn "无法读取分区信息: $_"
+        return @()
+    }
+    if ($parts.Count -eq 0) {
+        Write-Host "  （无分区：空盘或未初始化）" -ForegroundColor DarkGray
+        return $parts
+    }
+    Write-Host ("  {0,-6}{1,-12}{2,-8}{3,-14}{4}" -f "序号", "大小", "盘符", "类型", "卷标")
+    foreach ($p in $parts) {
+        $size = "{0:N1} GB" -f ($p.Size / 1GB)
+        $letters = (($p.DriveLetter | ForEach-Object { "$_:" }) -join ",")
+        $type = switch ($p.GptType) {
+            $GuidEfi      { "EFI系统分区"; break }
+            $GuidMsr      { "MSR保留分区"; break }
+            $GuidRecovery { "恢复分区"; break }
+            default       { if ($p.IsActive) { "活动分区" } else { "数据分区" } }
+        }
+        $label = ""
+        try {
+            $vol = Get-Volume -Partition $p -ErrorAction SilentlyContinue
+            if ($vol) { $label = $vol.FileSystemLabel }
+        } catch {}
+        Write-Host ("  {0,-6}{1,-12}{2,-8}{3,-14}{4}" -f $p.PartitionNumber, $size, $letters, $type, $label)
+    }
+    return $parts
+}
+
+function Set-DriveLetter([int]$diskNum, [int]$partNum, [string]$letter) {
+    # 先释放被占用的目标盘符
+    Get-Partition -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter -eq $letter } |
+        ForEach-Object { $_ | Remove-PartitionAccessPath -AccessPath ($letter + ":") }
+    $p = Get-Partition -DiskNumber $diskNum -PartitionNumber $partNum -ErrorAction Stop
+    if ($p.DriveLetter) {
+        $p | Remove-PartitionAccessPath -AccessPath ($p.DriveLetter + ":")
+        $p = Get-Partition -DiskNumber $diskNum -PartitionNumber $partNum -ErrorAction Stop
+    }
+    $p | Add-PartitionAccessPath -AccessPath ($letter + ":")
+}
+
 # ---------- 1. 环境检查 ----------
 Write-Step "环境检查"
 if (-not (Test-Path "$env:SystemRoot\System32\wpeutil.exe")) {
@@ -100,34 +151,46 @@ $choice = Read-Choice "选择要安装的镜像" 1 $images.Count 1
 $img = $images[$choice - 1]
 Write-Ok ("已选择: {0}" -f $img.name)
 
-# ---------- 5. 破坏性操作确认 ----------
-Write-Host ""
-Write-Warn "警告：安装将清空目标磁盘的全部数据！"
-$confirm = Read-Host '确认继续请输入 YES（区分大小写）'
-if ($confirm -cne "YES") {
-    Write-Host "已取消。"
-    exit 0
-}
-
 # ---------- 6. 选择目标磁盘 ----------
 Write-Step "选择目标磁盘"
 $disks = @()
 try {
-    $disks = Get-Disk | Where-Object { $_.BusType -ne "USB" -or $true } | Sort-Object Number
+    $disks = Get-Disk | Sort-Object Number
 } catch {}
 if ($disks.Count -gt 0) {
     Write-Host ""
     foreach ($d in $disks) {
         $sizeGB = "{0:N0} GB" -f ($d.Size / 1GB)
-        Write-Host ("  [{0}] 磁盘 {1}  {2}  {3}  {4}" -f $d.Number, $d.Number, $d.FriendlyName, $sizeGB, $d.PartitionStyle)
+        $tag = if ($d.BusType -eq "USB") { "[U 盘]" } else { "" }
+        Write-Host ("  [{0}] 磁盘 {1}  {2}  {3}  {4} {5}" -f $d.Number, $d.Number, $d.FriendlyName, $sizeGB, $d.PartitionStyle, $tag)
     }
     $diskNum = Read-Choice "选择目标磁盘编号" 0 99 0
 } else {
     Write-Warn "无法枚举磁盘，默认使用磁盘 0"
     $diskNum = 0
 }
-# 把 diskpart 模板中的 select disk 0 替换为用户选择的编号
-$tplName = $null
+
+# ---------- 6b. 显示分区布局 ----------
+$parts = Show-DiskLayout $diskNum
+
+# ---------- 6c. 选择安装模式 ----------
+Write-Host ""
+Write-Host "  安装模式："
+Write-Host "  [1] 整盘清空安装：删除所选磁盘的全部的分區，全新分区安装"
+Write-Host "  [2] 保留分区安装：只格式化一个选定分区，其他分区数据保留"
+$installMode = Read-Choice "选择安装模式" 1 2 1
+
+Write-Host ""
+if ($installMode -eq 1) {
+    Write-Warn "警告：整盘安装将删除磁盘 $diskNum 上的全部分区和数据！"
+} else {
+    Write-Warn "警告：保留安装将格式化你选定的系统分区（该分区数据丢失），其他分区不受影响。"
+}
+$confirm = Read-Host '确认继续请输入 YES（区分大小写）'
+if ($confirm -cne "YES") {
+    Write-Host "已取消。"
+    exit 0
+}
 
 # ---------- 7. 固件类型 ----------
 $fwType = 2  # 默认 UEFI
@@ -136,21 +199,74 @@ try {
 } catch {}
 $isUefi = ($fwType -eq 2)
 Write-Step ("固件类型: " + ($isUefi ? "UEFI" : "传统 BIOS"))
-$tplName = if ($isUefi) { "diskpart-uefi.txt" } else { "diskpart-bios.txt" }
-$tplPath = Join-Path $ScriptDir $tplName
-$tplContent = Get-Content $tplPath -Raw
-$tplContent = $tplContent -replace "select disk 0", "select disk $diskNum"
-$tmpTpl = Join-Path $env:TEMP "diskpart-run.txt"
-$tplContent | Set-Content $tmpTpl -Encoding ASCII
 
-# ---------- 8. 分区 ----------
-Write-Step "正在分区（diskpart）..."
-diskpart /s $tmpTpl | Out-Null
-if (-not (Test-Path "W:\")) {
-    Write-Err "分区失败：未找到 W: 盘，请检查 diskpart 输出后重试。"
-    exit 1
+# ---------- 8. 准备目标分区 ----------
+if ($installMode -eq 1) {
+    # --- 模式1：整盘清空，diskpart 按模板重建 ---
+    $tplName = if ($isUefi) { "diskpart-uefi.txt" } else { "diskpart-bios.txt" }
+    $tplPath = Join-Path $ScriptDir $tplName
+    $tplContent = Get-Content $tplPath -Raw
+    $tplContent = $tplContent -replace "select disk 0", "select disk $diskNum"
+    $tmpTpl = Join-Path $env:TEMP "diskpart-run.txt"
+    $tplContent | Set-Content $tmpTpl -Encoding ASCII
+    Write-Step "正在分区（diskpart 整盘重建）..."
+    diskpart /s $tmpTpl | Out-Null
+    if (-not (Test-Path "W:\")) {
+        Write-Err "分区失败：未找到 W: 盘，请检查 diskpart 输出后重试。"
+        exit 1
+    }
+    Write-Ok "分区完成（系统盘 W:，EFI 分区 S:）"
+} else {
+    # --- 模式2：保留其他分区，只格式化选定分区 ---
+    Write-Step "保留分区安装：选择系统目标分区"
+    $candidates = @($parts | Where-Object {
+        $_.GptType -notin @($GuidEfi, $GuidMsr, $GuidRecovery)
+    })
+    if ($candidates.Count -eq 0) {
+        Write-Err "该磁盘上没有可用的数据分区，请改用整盘安装。"
+        exit 1
+    }
+    Write-Host ""
+    Write-Host "  可选分区（序号对应上表，EFI/MSR/恢复分区已排除）："
+    foreach ($c in $candidates) {
+        $size = "{0:N1} GB" -f ($c.Size / 1GB)
+        Write-Host ("  [{0}] 分区 {0}  {1}" -f $c.PartitionNumber, $size)
+    }
+    $partNum = Read-Choice "输入分区序号" 1 999 $candidates[0].PartitionNumber
+    $target = $candidates | Where-Object { $_.PartitionNumber -eq $partNum } | Select-Object -First 1
+    if (-not $target) {
+        Write-Err "无效的分区序号。"
+        exit 1
+    }
+    $tSize = "{0:N1} GB" -f ($target.Size / 1GB)
+    if ($target.Size -lt 40GB) {
+        Write-Warn "该分区仅 $tSize，Windows 建议至少 64GB，空间不足可能安装失败"
+    }
+    Write-Step ("正在格式化分区 {0}（{1}）为 NTFS..." -f $partNum, $tSize)
+    try {
+        Format-Volume -Partition $target -FileSystem NTFS -NewFileSystemLabel "Windows" -Confirm:$false -Force -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Err "格式化失败: $_"
+        exit 1
+    }
+    Set-DriveLetter $diskNum $partNum "W"
+    if (-not (Test-Path "W:\")) {
+        Write-Err "盘符分配失败。"
+        exit 1
+    }
+    if ($isUefi) {
+        $efi = $parts | Where-Object { $_.GptType -eq $GuidEfi } | Select-Object -First 1
+        if (-not $efi) {
+            Write-Err "UEFI 模式下未找到 EFI 系统分区，无法写入引导，请改用整盘安装。"
+            exit 1
+        }
+        Set-DriveLetter $diskNum $efi.PartitionNumber "S"
+        Write-Ok ("复用现有 EFI 系统分区（分区 {0}）" -f $efi.PartitionNumber)
+    } else {
+        try { Set-Partition -DiskNumber $diskNum -PartitionNumber $partNum -IsActive $true -ErrorAction Stop } catch {}
+    }
+    Write-Ok "目标分区就绪（W:），其他分区数据保留"
 }
-Write-Ok "分区完成（系统盘 W:，EFI 分区 S:）"
 
 # ---------- 9. 获取镜像文件 ----------
 $wimPath = $null
@@ -272,11 +388,12 @@ if ($proto -eq "smb") {
 }
 try {
     $report = @{
-        event    = "install_completed"
-        image_id = $img.id
-        disk     = $diskNum
-        firmware = ($isUefi ? "UEFI" : "BIOS")
-        computer = $env:COMPUTERNAME
+        event        = "install_completed"
+        image_id     = $img.id
+        disk         = $diskNum
+        install_mode = ($installMode -eq 1 ? "full_wipe" : "keep_partitions")
+        firmware     = ($isUefi ? "UEFI" : "BIOS")
+        computer     = $env:COMPUTERNAME
     } | ConvertTo-Json -Compress
     Invoke-RestMethod -Method Post -Uri "$base/api/report" `
         -Body $report -ContentType "application/json" -TimeoutSec 10 | Out-Null

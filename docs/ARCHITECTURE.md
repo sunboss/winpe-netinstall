@@ -27,10 +27,13 @@ Python 3 标准库实现，无第三方依赖，方便丢到任何机器上跑�
 - **运行**：`NetInstall.ps1` 全流程：
   1. 检查 WinPE 环境 → `wpeutil InitializeNetwork`
   2. 读取 `server.txt`（可现场改）→ 3 次重试连通性
-  3. 拉清单 → 数字菜单选镜像 → 输入 `YES` 二次确认
-  4. 枚举磁盘 → 读注册表 `PEFirmwareType` 判定 UEFI/BIOS
-  5. `diskpart` 按模板分区（EFI 100MB + MSR 16MB + Windows；BIOS 则单分区+active）
-  6. 取镜像：
+  3. 拉清单 → 数字菜单选镜像
+  4. 枚举磁盘 → **显示分区布局**（序号/大小/盘符/类型/卷标）
+  5. 选择安装模式 → 按模式二次确认（输入 `YES`）：
+     - **整盘清空**：`diskpart` 按模板重建（UEFI：EFI 100MB + MSR 16MB + Windows；BIOS：单分区+active）
+     - **保留分区**：只格式化选定的一个数据分区（EFI/MSR/恢复分区不可选），UEFI 下复用现有 EFI 分区写引导
+  6. 读注册表 `PEFirmwareType` 判定 UEFI/BIOS
+  7. 取镜像：
      - `smb`：`net use Z:` 挂载共享，DISM 直接从网络路径释放（不占本地空间）
      - `http`：BITS 下载（断点续传）→ `Get-FileHash` SHA-256 校验 → 释放 → 删除临时文件
   7. `dism /Apply-Image` → `bcdboot` 写引导 → 可选 `X:\NetInstall\Drivers` 驱动注入
